@@ -4,5 +4,5 @@
 [IOS](https://x.gd/R1DOz)  
 [Steam](https://x.gd/PpFth)  
 ---
-[ポリリリリズム作者X]https://x.com/NamariKarte
-[BOT作者X]https://x.com/Almostcat_kyopr  
+[ポリリリリズム作者X](https://x.com/NamariKarte)
+[BOT作者X](https://x.com/Almostcat_kyopr)
