@@ -1,158 +1,270 @@
 cat > bot.py << 'PY'
-
 import discord
 from discord import option
-import subprocess
-import os
-import datetime
+import subprocess, os, datetime, asyncio, functools, re, time, json
 from dotenv import load_dotenv
-import asyncio
-import functools
-import re
-import time
+import google.generativeai as genai
 
-# --- 1. 初期設定 ---
-ENABLE_FFMPEG_PROGRESS_LOG = True
-DEBUG_PASSWORD = "polyrhythm_debug"
+#--- 1. 初期設定 ---
 load_dotenv()
+DEBUG_PASSWORD = "polyrhythm_debug"
+MAX_TUPLET_DIVISION = 3
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-if TOKEN is None:
-    print("エラー: DISCORD_BOT_TOKENが.envファイルに設定されていません。")
-    exit()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None) 
 
-intents = discord.Intents.default()
-intents.members = True
+if not TOKEN: print("エラー: DISCORD_BOT_TOKENが.envにありません。"); exit()
+
+# Geminiモデルの初期化
+genai_model = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        genai_model = genai.GenerativeModel('gemini-2.5-flash')
+        print("Gemini AI 校正機能が有効になりました。")
+    except Exception as e:
+        print(f"Geminiの初期化に失敗: {e}\nAI校正機能は無効です。")
+else:
+    print("GEMINI_API_KEYが設定されていません。AI校正機能は無効です。")
+
+intents = discord.Intents.default(); intents.members = True
 bot = discord.Bot(intents=intents)
 
-# --- 2. ゲームの状態を管理するグローバル変数 ---
-quiz_state = { "is_active": False, "channel_id": None, "quiz_master_id": None, "correct_answer_sorted": None, "correct_answer_raw": "N/A", "start_time": None, "current_points": 1, "is_answering": False, "answer_log": [], "is_debug_mode": False, "answer_video_path": None, "is_generating": False, }
+#--- 2. ゲームの状態管理 ---
+quiz_state = {
+    "is_active": False, "channel_id": None, "quiz_master_id": None,
+    "correct_answer_normalized": None, "correct_answer_raw": "N/A",
+    "start_time": None, "current_points": 1, "is_answering": False, "answer_log": [],
+    "is_debug_mode": False, "answer_video_path": None, "is_generating": False,
+}
 scores, cooldowns = {}, {}
 auto_end_timer_task = None
 
-def blocking_video_process_with_monitoring(command):
-    unbuffered_command = [command[0], "-u"] + command[1:]
-    
-    print(f"任務: {' '.join(unbuffered_command)}")
-    
-    process = subprocess.Popen(
-        unbuffered_command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
-
-    total_duration_seconds = 0
-    last_logged_percent = -1
-    
-    duration_regex = re.compile(r"Duration: (\d{2}):(\d{2}):(\d{2})\.\d{2}")
-    progress_regex = re.compile(r"frame=\s*(\d+)\s*fps=.*time=(\d{2}):(\d{2}):(\d{2})\.\d{2}") # timeだけでなくframeも見る
-
-    for line in iter(process.stderr.readline, ''):
-        line_str = line.strip()
-        
-        print(f"[ stderr ] {line_str}")
-
-        if total_duration_seconds == 0:
-            duration_match = duration_regex.search(line_str)
-            if duration_match:
-                h, m, s = map(int, duration_match.groups())
-                total_duration_seconds = h * 3600 + m * 60 + s
-                print(f"動画再生時間:{total_duration_seconds")
-                continue
-
-        progress_match = progress_regex.search(line_str)
-        if progress_match and total_duration_seconds > 0:
-            frame, h, m, s = progress_match.groups()
-            current_seconds = int(h) * 3600 + int(m) * 60 + float(s)
-            percent = int((current_seconds / total_duration_seconds) * 100)
-            
-            if percent > last_logged_percent:
-                last_logged_percent = percent
-                print(f"進捗:{percent}%...")
-
-    process.wait()
-    
-    if process.returncode != 0:
-        stdout_output = process.stdout.read()
-        stderr_output = process.stderr.read()
-        print(f"エラー:\n--- STDOUT ---\n{stdout_output}\n--- STDERR ---\n{stderr_output}")
-        raise subprocess.CalledProcessError(process.returncode, command, stderr=stderr_output)
-    else:
-        print("成功")
-
-async def run_video_process_with_monitoring(command, timeout):
-    loop = asyncio.get_running_loop()
-    blocking_func = functools.partial(blocking_video_process_with_monitoring, command)
-    await asyncio.wait_for(loop.run_in_executor(None, blocking_func), timeout=timeout)
-
+#--- 3. 非同期・ヘルパー関数 ---
 async def run_subprocess_async(command, timeout):
-    blocking_func = functools.partial(subprocess.run, command, check=True, capture_output=True, text=True, timeout=timeout)
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, blocking_func)
-    return result
+    return await asyncio.get_running_loop().run_in_executor(None,
+        functools.partial(subprocess.run, command, check=True, capture_output=True, text=True, timeout=timeout))
 
-# --- 3. ヘルパー関数 ---
-def parse_and_sort_answer(pattern: str): return sorted([p.strip().lower() for p in pattern.split(':') if p.strip()])
-def sort_key_for_answer(item: str):
-    num_str = item.replace('o', ''); return int(num_str) if num_str.isdigit() else -1
+def parse_and_normalize_pattern(pattern_str: str):
+    normalized_parts = []
+    for part in pattern_str.split(':'):
+        part = part.strip().lower()
+        if not part: continue
+        match = re.match(r'(\d+)(?:\s*\[(.*?)\])?(o)?$', part)
+        if not match: raise ValueError(f"無効なパターン部分: {part}")
+        
+        k_str, options_str, off_beat_char = match.groups()
+        k = int(k_str)
+        is_off_beat = (off_beat_char == 'o')
+        rests, tuplets = set(), {}
+        
+        if options_str:
+            options = [opt.strip() for opt in options_str.split(',') if opt.strip()]
+            for opt in options:
+                if opt.startswith('t'):
+                    tuplet_match = re.match(r't(\d+)=(\d+)', opt)
+                    division, beat_num = map(int, tuplet_match.groups())
+                    if beat_num not in tuplets:
+                        tuplets[beat_num] = {'division': division, 'rests': set()}
+            for opt in options:
+                r_tuplet_match = re.match(r'r=(\d+)\[(\d+)\]', opt)
+                if r_tuplet_match:
+                    beat_num, rest_idx = map(int, r_tuplet_match.groups())
+                    if beat_num in tuplets:
+                        tuplets[beat_num]['rests'].add(rest_idx)
+                elif opt.startswith('r='):
+                    simple_r_match = re.match(r'r=(\d+)$', opt)
+                    if simple_r_match:
+                        rests.add(int(simple_r_match.groups()[0]))
+        
+        sorted_rests = tuple(sorted(list(rests)))
+        
+        normalized_tuplets = []
+        for beat_num, info in sorted(tuplets.items()):
+            sorted_tuplet_rests = tuple(sorted(list(info['rests'])))
+            normalized_tuplets.append((beat_num, (info['division'], sorted_tuplet_rests)))
+        
+        normalized_parts.append((k, is_off_beat, sorted_rests, tuple(normalized_tuplets)))
+    
+    return tuple(sorted(normalized_parts))
+
+def validate_pattern(pattern: str):
+    if any(not part.strip() for part in pattern.split(':')):
+        return "':'が連続するなど、パターン指定が無効です。"
+        
+    for part in pattern.split(':'):
+        part = part.strip().lower()
+        match = re.match(r'(\d+)(?:\s*\[(.*?)\])?(o)?$', part)
+        if not match: return f"`{part}`は有効な拍子指定ではありません。"
+        k_str, options_str, off_beat_char = match.groups()
+        
+        if off_beat_char and not part.endswith('o'):
+             return f"裏拍を示す`o`は末尾に。`{part}`は無効です。"
+
+        k = int(k_str)
+        if not (2 <= k <= 31): return f"拍子数は2以上31まで。`{k}`は無効です。"
+        
+        if options_str:
+            processed_beats = set()
+            defined_tuplets = {}
+            options = [opt.strip() for opt in options_str.split(',') if opt.strip()]
+
+            for opt in options:
+                if opt.startswith('t'):
+                    t_match = re.match(r't(\d+)=(\d+)', opt)
+                    if not t_match: return f"連符の指定 `{opt}` が無効です。"
+                    division, beat = map(int, t_match.groups())
+                    if not (2 <= division <= MAX_TUPLET_DIVISION): return f"連符は現在{MAX_TUPLET_DIVISION}連符までです。"
+                    if not (1 <= beat <= k): return f"{k}拍子で{beat}拍目は指定できません。"
+                    if beat in processed_beats: return f"{beat}拍目に複数の指定はできません。"
+                    processed_beats.add(beat)
+                    defined_tuplets[beat] = division
+            
+            for opt in options:
+                if opt.startswith('r='):
+                    r_tuplet_match = re.match(r'r=(\d+)\[(\d+)\]', opt)
+                    simple_r_match = re.match(r'r=(\d+)$', opt)
+
+                    if r_tuplet_match:
+                        beat, idx = map(int, r_tuplet_match.groups())
+                        if beat not in defined_tuplets: return f"`r={beat}[{idx}]` を指定しましたが、対応する連符(t)の定義がありません。"
+                        if not (1 <= idx <= defined_tuplets[beat]): return f"{beat}拍目の{defined_tuplets[beat]}連符に{idx}番目の音符はないため、休符にできません。"
+                    elif simple_r_match:
+                        beat = int(simple_r_match.groups()[0])
+                        if not (1 <= beat <= k): return f"{k}拍子で{beat}拍目は指定できません。"
+                        if beat in processed_beats: return f"{beat}拍目には既に連符が指定されているため、休符にできません。"
+                        processed_beats.add(beat)
+                    else:
+                        return f"休符の指定 `{opt}` が無効です。"
+
+            for opt in options:
+                if not (opt.startswith('t') or opt.startswith('r=')):
+                    return f"オプション `{opt}` は認識できません。"
+    return None
+
 def generate_ranking_text():
     if not scores: return "まだ誰もスコアを獲得していません。"
     sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     ranking_lines = ["**🏆 現在のランキング 🏆**"]
     for i, (user_id, score) in enumerate(sorted_scores[:5]):
-        try:
-            user = bot.get_user(user_id)
-            user_name = user.display_name if user else f"ユーザー({str(user_id)[-4:]})"
-            ranking_lines.append(f"**{i+1}位**: {user_name} - {score}ポイント")
-        except: ranking_lines.append(f"**{i+1}位**: 不明なユーザー - {score}ポイント")
+        user = bot.get_user(user_id)
+        user_name = user.display_name if user else f"ユーザー({str(user_id)[-4:]})"
+        ranking_lines.append(f"**{i+1}位**: {user_name} - {score}ポイント")
     return "\n".join(ranking_lines)
 
-# --- 4. 非同期キープアライブタスク ---
+#--- 4 & 5. タスク ---
 keep_alive = None
 async def keep_alive_task():
-    await bot.wait_until_ready(); print("[Keep-Alive] ウォームアップタスクを開始します。")
+    await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            print("[Keep-Alive] ウォームアップ処理を実行中...")
-            command = ["python", "polyrhythm.py", "4:3", "keep_alive.png"]
-            await run_subprocess_async(command, timeout=30)
-            print("[Keep-Alive] ウォームアップ成功。"); await asyncio.sleep(300)
-        except asyncio.CancelledError: print("[Keep-Alive] タスクがキャンセルされました。"); break
-        except Exception as e:
-            stderr = e.stderr if hasattr(e, 'stderr') else str(e)
-            print(f"[Keep-Alive] ウォームアップ中にエラー: {stderr}"); await asyncio.sleep(60)
+            await run_subprocess_async(["python", "polyrhythm.py", "4:3", "keep_alive.png"], timeout=30)
+            await asyncio.sleep(300)
+        except Exception as e: await asyncio.sleep(60)
 
-# --- 5. クイズモード自動終了タスク ---
 async def end_quiz_after_delay():
     await asyncio.sleep(900)
     if quiz_state["is_active"]:
+        if quiz_state.get("answer_video_path") and os.path.exists(quiz_state["answer_video_path"]):
+            os.remove(quiz_state["answer_video_path"])
         channel = bot.get_channel(quiz_state["channel_id"])
-        video_path = quiz_state.get("answer_video_path")
-        if video_path and os.path.exists(video_path):
-            try: os.remove(video_path); print(f"[AutoEnd] 不要な動画 {video_path} を削除。")
-            except Exception as e: print(f"[AutoEnd] 動画削除に失敗: {e}")
-        if channel:
-            try: await channel.send("🕒 15分間操作がなかったため、クイズモードを自動終了しました。")
-            except discord.Forbidden: print(f"Error: Channel {quiz_state['channel_id']} にメッセージを送信する権限がありません。")
-        quiz_state["is_active"] = False; print("クイズモードを自動終了しました。")
+        if channel: await channel.send("🕒 15分間操作がなかったため、クイズモードを自動終了しました。")
+        quiz_state["is_active"] = False
 
-# --- 6. Botイベント ---
+#--- 6. Botイベント ---
 @bot.event
 async def on_ready():
     print(f"{bot.user} としてログインしました")
     global keep_alive
     if keep_alive is None: keep_alive = bot.loop.create_task(keep_alive_task())
 
-# --- 7. コマンド定義 ---
+#--- AI校正機能とコマンドのコアロジック ---
+class ConfirmCorrectionView(discord.ui.View):
+    def __init__(self, author_id, params):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.params = params
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message("コマンドを実行した本人しか操作できません。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="はい、修正案で実行", style=discord.ButtonStyle.green)
+    async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(content=f"✅ 修正案を適用して実行します...", view=None)
+        await _execute_polyrhythm_generation(interaction, **self.params)
+
+    @discord.ui.button(label="いいえ、キャンセル", style=discord.ButtonStyle.red)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(content="キャンセルしました。", view=None)
+
+async def get_ai_correction(wrong_pattern: str):
+    if not genai_model: return None
+    system_prompt = """
+    あなたは、ポリリズム記法の構文エラーを修正する専門家です。
+    ユーザーが入力した間違った文字列を受け取り、正しい構文に修正した上で、修正理由を20字以内で簡潔に説明してください。
+    出力は必ず以下のJSON形式で返してください: {"suggestion": "修正後の文字列", "explanation": "修正理由"}
+
+    # 正しい構文ルール:
+    - 基本形: `拍子数:拍子数` (例: `4:3`)
+    - 裏拍: `拍子数o` (例: `4o`)
+    - オプション: `拍子数[...]` (例: `4[r=1]`)
+    - 休符: `r=<拍番号>` (例: `r=1`)
+    - 連符: `t<分割数>=<拍番号>` (例: `t3=2`)
+    - 連符内休符: `r=<拍番号>[<ノート番号>]` (例: `r=2[2]`)
+    """
+    try:
+        full_prompt = system_prompt + f"\n# 間違った入力:\n`{wrong_pattern}`"
+        response = await genai_model.generate_content_async(full_prompt)
+        cleaned_response = re.sub(r'```json\s*(.*?)\s*```', r'\1', response.text, flags=re.DOTALL).strip()
+        data = json.loads(cleaned_response)
+        if "suggestion" in data and "explanation" in data:
+            return data
+    except Exception as e:
+        print(f"AI校正エラー: {e}")
+    return None
+
+async def _execute_polyrhythm_generation(responder, pattern: str, mode: str, bpm: int, judge_window: bool):
+    """ポリリズム生成の実行を担当する共通関数。"""
+    try:
+        progress_message = await responder.followup.send(f"`{pattern}` の生成を開始します...", ephemeral=True)
+        output_filename = "out.png" if mode == "image" else "out.mp4" if mode == "video" else "out.mp3"
+        
+        command = ["python", "polyrhythm.py", pattern, output_filename]
+        if judge_window and mode == "image": command.append("--judge-window")
+        if mode == "video": command.extend(["--video", f"--bpm={bpm}"])
+        elif mode == "audio": command.extend(["--audio-only", f"--bpm={bpm}"])
+        
+        result = await run_subprocess_async(command, timeout=300)
+        
+        await progress_message.delete()
+        with open(output_filename, "rb") as f:
+            await responder.channel.send(content=f"{responder.user.mention} さんからのリクエスト:", file=discord.File(f, filename=output_filename))
+            
+    except Exception as e:
+        stderr_message = e.stderr if hasattr(e, 'stderr') else str(e)
+        # もし responder.followup が失敗したら、元のチャンネルにエラーを送る
+        try:
+            await responder.followup.send(f"エラーが発生しました。\n```{stderr_message}```", ephemeral=True)
+        except:
+            await responder.channel.send(f"{responder.user.mention} エラーが発生しました。\n```{stderr_message}```")
+
+#--- 7. コマンド ---
 quiz_group = bot.create_group("quiz", "ポリリズム当てクイズ関連のコマンドです。")
+
 @quiz_group.command(name="start", description="ポリリズム当てクイズを開始します。")
 async def launch_quiz_mode(ctx):
     global scores, cooldowns, auto_end_timer_task
     await ctx.defer()
-    if quiz_state["is_active"]: await ctx.followup.send("既に別のクイズが進行中です！", ephemeral=True); return
-    quiz_state.update({"is_active": True, "channel_id": ctx.channel.id, "quiz_master_id": ctx.author.id, "correct_answer_sorted": None, "is_answering": False, "answer_log": [], "is_debug_mode": False})
+    if quiz_state["is_active"]:
+        await ctx.followup.send("既に別のクイズが進行中です！", ephemeral=True)
+        return
+    
+    quiz_state.update({"is_active": True, "channel_id": ctx.channel.id, "quiz_master_id": ctx.author.id,"correct_answer_normalized": None, "is_answering": False, "answer_log": [],"is_debug_mode": False})
     scores, cooldowns = {}, {}
     if auto_end_timer_task: auto_end_timer_task.cancel()
     auto_end_timer_task = asyncio.create_task(end_quiz_after_delay())
@@ -162,172 +274,253 @@ async def launch_quiz_mode(ctx):
 async def end_quiz_mode(ctx):
     global auto_end_timer_task
     await ctx.defer()
-    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]: await ctx.followup.send("クイズを開始した本人しか終了できません。", ephemeral=True); return
-    if quiz_state.get("is_generating", False): await ctx.followup.send("現在、問題を作成中です。完了してから終了してください。", ephemeral=True); return
+    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]:
+        await ctx.followup.send("クイズを開始した本人しか終了できません。", ephemeral=True)
+        return
+    
+    if quiz_state.get("is_generating", False):
+        await ctx.followup.send("現在、問題を作成中です。完了してから終了してください。", ephemeral=True)
+        return
+
     video_path = quiz_state.get("answer_video_path")
     if video_path and os.path.exists(video_path):
-        try: os.remove(video_path); print(f"不要になった動画ファイル {video_path} を削除しました。")
+        try: os.remove(video_path)
         except Exception as e: print(f"動画ファイル {video_path} の削除に失敗: {e}")
+
     final_ranking = generate_ranking_text()
     await ctx.followup.send(f"🏁 **クイズモードを終了しました！**\n\n{final_ranking}")
     quiz_state["is_active"] = False
     if auto_end_timer_task: auto_end_timer_task.cancel()
 
 @quiz_group.command(name="new", description="新しいクイズを出題します（出題者のみ）。")
-@option("pattern", description="問題となるパターン (例: 7:5:3o)")
-@option("bpm", int, description="問題のBPM (テンポ)", min_value=30, max_value=150, default=80)
+@option("pattern", description="問題パターン (例: 4[t2=2,r=2[1]]:5o)")
+@option("bpm", int, description="BPM (30-400)", min_value=30, max_value=400, default=80)
 @option("points", int, description="正解時に獲得できるポイント", min_value=1, default=1)
 async def new_quiz(ctx, pattern: str, bpm: int, points: int):
     global cooldowns, auto_end_timer_task
+
+    if quiz_state.get("is_generating"):
+        await ctx.respond("現在、別の問題を作成中です。完了まで今しばらくお待ちください。", ephemeral=True)
+        return
+
+    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]:
+        await ctx.respond("クイズの出題者しか問題は出せません。", ephemeral=True)
+        return
+
+    validation_error = validate_pattern(pattern)
+    if validation_error:
+        await ctx.respond(f"入力エラー: {validation_error}", ephemeral=True)
+        return
+    
     await ctx.defer()
-    if quiz_state.get("is_generating", False): await ctx.followup.send("現在、別の問題を作成中です。完了まで今しばらくお待ちください。", ephemeral=True); return
-    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]: await ctx.followup.send("クイズの出題者しか問題は出せません。", ephemeral=True); return
-    if pattern == DEBUG_PASSWORD:
-        current_state = quiz_state.get("is_debug_mode", False); quiz_state["is_debug_mode"] = not current_state
-        status = "有効" if quiz_state["is_debug_mode"] else "無効"; await ctx.followup.send(f"🛠️ **デバッグモードを【{status}】に切り替えました。**", ephemeral=True); return
     quiz_state["is_generating"] = True
     try:
-        await ctx.followup.send("新しい問題を作成中です… 音声と**答えの動画**を準備しています。", ephemeral=True)
-        cooldowns = {}; output_audio = "quiz_audio.mp3"; output_video = f"answer_{int(time.time())}.mp4"
-        cmd_audio = ["python", "polyrhythm.py", pattern, output_audio, "--audio-only", f"--bpm={bpm}"]
-        await run_subprocess_async(cmd_audio, timeout=60)
-        sorted_list = sorted(parse_and_sort_answer(pattern), key=sort_key_for_answer, reverse=True)
-        video_pattern = ":".join(sorted_list)
-        cmd_video = ["python", "polyrhythm.py", video_pattern, output_video, "--video", f"--bpm=80"]
-        if ENABLE_FFMPEG_PROGRESS_LOG: await run_video_process_with_monitoring(cmd_video, timeout=300)
-        else: await run_subprocess_async(cmd_video, timeout=300)
-        quiz_state.update({"correct_answer_sorted": parse_and_sort_answer(pattern), "correct_answer_raw": pattern, "start_time": datetime.datetime.now(), "current_points": points, "answer_log": [], "answer_video_path": output_video,})
+        output_audio, output_video = "quiz_audio.mp3", f"answer_{int(time.time())}.mp4"
+        await run_subprocess_async(["python","polyrhythm.py",pattern,output_audio,"--audio-only",f"--bpm={bpm}"], timeout=60)
+        
+        normalized_answer = parse_and_normalize_pattern(pattern)
+        parts_for_video = []
+        for k, is_off, rests, tuplets in sorted(list(normalized_answer), key=lambda x: x[0], reverse=True):
+            opts_list = []
+            if rests: opts_list.extend([f"r={r}" for r in rests])
+            if tuplets:
+                for beat_num, (division, tuplet_rests) in tuplets:
+                    opts_list.append(f"t{division}={beat_num}")
+                    if tuplet_rests: opts_list.extend([f"r={beat_num}[{idx}]" for idx in tuplet_rests])
+            
+            opts_str = f"[{','.join(sorted(opts_list))}]" if opts_list else ""
+            parts_for_video.append(f"{k}{opts_str}{'o' if is_off else ''}")
+        video_pattern = ":".join(parts_for_video)
+
+        await run_subprocess_async(["python","polyrhythm.py",video_pattern,output_video,"--video",f"--bpm=80"], timeout=300)
+
+        quiz_state.update({"correct_answer_normalized": normalized_answer, "correct_answer_raw": pattern, "start_time": datetime.datetime.now(), "current_points": points, "answer_log": [], "answer_video_path": output_video,})
+        cooldowns = {}
         if auto_end_timer_task: auto_end_timer_task.cancel()
         auto_end_timer_task = asyncio.create_task(end_quiz_after_delay())
-        with open(output_audio, "rb") as f: await ctx.followup.send(f"**❓ 新しい問題です！** (BPM: {bpm} / **{points}ポイント**)\n`/quiz answer`で回答！", file=discord.File(f, filename=output_audio))
+        
+        with open(output_audio, "rb") as f:
+            await ctx.followup.send(f"**❓ 新しい問題です！** (BPM: {bpm} / **{points}ポイント**)\n`/quiz answer`で回答！", file=discord.File(f, filename=output_audio))
     except Exception as e:
-        stderr_message = e.stderr if hasattr(e, 'stderr') else str(e)
-        await ctx.followup.send(f"申し訳ありません、問題の生成に失敗しました。\n```{stderr_message}```")
-    finally: quiz_state["is_generating"] = False
+        await ctx.followup.send(f"問題の生成に失敗しました。\n```{e.stderr if hasattr(e,'stderr') else e}```")
+    finally:
+        quiz_state["is_generating"] = False
 
 @quiz_group.command(name="answer", description="出題されたクイズに回答します。")
-@option("pattern", description="あなたの回答 (例: 3o:7:5)")
+@option("pattern", description="あなたの回答 (例: 5:4[t2=2,r=2[1]])")
 async def answering(ctx, pattern: str):
-    if not quiz_state["is_active"] or quiz_state["correct_answer_sorted"] is None: await ctx.respond("現在、回答を受け付けている問題はありません。", ephemeral=True); return
-    if ctx.author.id == quiz_state["quiz_master_id"] and not quiz_state.get("is_debug_mode", False): await ctx.respond("出題者は回答できません！", ephemeral=True); return
+    if not quiz_state["is_active"] or quiz_state["correct_answer_normalized"] is None:
+        await ctx.respond("現在、回答を受け付けている問題はありません。", ephemeral=True)
+        return
+    if ctx.author.id == quiz_state["quiz_master_id"] and not quiz_state.get("is_debug_mode", False):
+        await ctx.respond("出題者は回答できません！", ephemeral=True)
+        return
     if ctx.author.id in cooldowns and datetime.datetime.now() < cooldowns[ctx.author.id]:
         remaining = (cooldowns[ctx.author.id] - datetime.datetime.now()).seconds
-        await ctx.respond(f"ペナルティ中です。あと **{remaining}秒** 待ってください。", ephemeral=True); return
-    if quiz_state["is_answering"]: await ctx.respond("現在、別の人が回答中です。少し待ってください！", ephemeral=True); return
+        await ctx.respond(f"ペナルティ中です。あと **{remaining}秒** 待ってください。", ephemeral=True)
+        return
+    if quiz_state["is_answering"]:
+        await ctx.respond("現在、別の人が回答中です。少し待ってください！", ephemeral=True)
+        return
+
     quiz_state["is_answering"] = True
+    try:
+        user_answer_normalized = parse_and_normalize_pattern(pattern)
+    except ValueError:
+        quiz_state["is_answering"] = False
+        await ctx.respond("回答の形式が正しくありません。", ephemeral=True)
+        return
+    
     quiz_state["answer_log"].append({"user": ctx.author.display_name, "answer": pattern, "time": datetime.datetime.now()})
-    user_answer_sorted = parse_and_sort_answer(pattern)
-    if user_answer_sorted == quiz_state["correct_answer_sorted"]:
+    
+    if user_answer_normalized == quiz_state["correct_answer_normalized"]:
         await ctx.defer()
-        time_elapsed = datetime.datetime.now() - quiz_state["start_time"]; elapsed_str = f"{time_elapsed.seconds // 60}分{time_elapsed.seconds % 60}秒"
-        points_won = quiz_state["current_points"]; scores[ctx.author.id] = scores.get(ctx.author.id, 0) + points_won
+        time_elapsed = datetime.datetime.now() - quiz_state["start_time"]
+        elapsed_str = f"{time_elapsed.seconds // 60}分{time_elapsed.seconds % 60}秒"
+        points_won = quiz_state["current_points"]
+        scores[ctx.author.id] = scores.get(ctx.author.id, 0) + points_won
+        
         await ctx.followup.send(f"🏆 **速報！ {ctx.author.display_name}さんが正解！** 🏆\n\n正解パターン: **`{quiz_state['correct_answer_raw']}`**\n解答時間: {elapsed_str}\nポイント: **+{points_won}** ポイント獲得！")
+        
         video_path = quiz_state.get("answer_video_path")
         try:
             if video_path and os.path.exists(video_path):
                 with open(video_path, "rb") as f:
                     ranking_text = generate_ranking_text()
                     await ctx.followup.send(f"お待たせいたしました！\nこちらが正解の動画と最新ランキングです。\n\n{ranking_text}", file=discord.File(f, filename=os.path.basename(video_path)),)
-            else: await ctx.followup.send("申し訳ありません、答えの動画ファイルが見つかりませんでした。")
+            else:
+                 await ctx.followup.send("申し訳ありません、答えの動画ファイルが見つかりませんでした。")
         finally:
             if video_path and os.path.exists(video_path): os.remove(video_path)
-        quiz_state["correct_answer_sorted"] = None; quiz_state["answer_video_path"] = None
+        quiz_state["correct_answer_normalized"] = None
+        quiz_state["answer_video_path"] = None
     else:
-        penalty_seconds = 20; is_handicap_target = False
-        if scores and ctx.author.id in scores:
-            sorted_scores_tuples = sorted(scores.items(), key=lambda item: item[1], reverse=True); sorted_scores_list = [s for u, s in sorted_scores_tuples]; num_players = len(sorted_scores_tuples)
-            player_rank = -1
-            for i, (uid, s) in enumerate(sorted_scores_tuples):
-                if uid == ctx.author.id: player_rank = i; break
-            is_solo_first = (player_rank == 0 and (num_players == 1 or sorted_scores_tuples[0][1] > sorted_scores_tuples[1][1]))
-            if is_solo_first:
-                is_handicap_target = True; p1_score = sorted_scores_list[0]; p2_score = sorted_scores_list[1] if num_players > 1 else 0; sum_lower_scores = sum(sorted_scores_list[1:])
-                if p2_score == 0 or sum_lower_scores <= 5: p1_handicap = 20 + p1_score * 4
-                else:
-                    p2_to_5_scores = sum(sorted_scores_list[1:5]); denominator = p2_to_5_scores + p2_score
-                    if denominator > 0: factor = (p1_score / (denominator / num_players)) * 0.8; p1_handicap = 20 * factor
-                    else: p1_handicap = 20
-                penalty_seconds = max(min(p1_handicap, 50), 20)
-            elif player_rank == 1:
-                p1_score = sorted_scores_list[0]; p2_score = sorted_scores_list[1]
-                if p1_score < p2_score * 1.4:
-                    is_handicap_target = True; p1_temp_handicap = 20; p1_p2_score = sorted_scores_list[1]; p1_sum_lower = sum(sorted_scores_list[1:])
-                    if p1_p2_score == 0 or p1_sum_lower <= 5: p1_temp_handicap = 20 + p1_score * 4
-                    else:
-                        p1_p2_to_5 = sum(sorted_scores_list[1:5]); p1_denom = p1_p2_to_5 + p1_p2_score
-                        if p1_denom > 0: p1_factor = (p1_score / (p1_denom / num_players)) * 1; p1_temp_handicap = 20 * p1_factor
-                    final_p1_handicap = max(min(p1_temp_handicap, 50), 20); p3_to_6_scores = sorted_scores_list[2:6]
-                    avg_p3_to_6 = sum(p3_to_6_scores) / len(p3_to_6_scores) if p3_to_6_scores else 0; calculated_p2_handicap = 0
-                    if avg_p3_to_6 > 0: calculated_p2_handicap = 20 * ((p2_score / avg_p3_to_6) * 0.7)
-                    capped_p2_handicap = max(min(calculated_p2_handicap, 35), 20); p1_related_limit = max(final_p1_handicap - 5, 20)
-                    penalty_seconds = min(capped_p2_handicap, p1_related_limit)
+        penalty_seconds = 20
         cooldowns[ctx.author.id] = datetime.datetime.now() + datetime.timedelta(seconds=int(penalty_seconds))
-        message = f"残念、不正解です！\nあなたの回答: `{pattern}`\n"
-        if is_handicap_target: message += f"**ハンデ適用！** **{int(penalty_seconds)}秒間** は回答できません。"
-        else: message += f"**{int(penalty_seconds)}秒間** は回答できません。"
+        message = f"残念、不正解です！\nあなたの回答: `{pattern}`\n**{int(penalty_seconds)}秒間** は回答できません。"
         await ctx.respond(message, ephemeral=True)
+        
     quiz_state["is_answering"] = False
 
 @quiz_group.command(name="show_answer", description="現在の問題の答えを表示します（出題者のみ）。")
 async def show_answer(ctx):
     await ctx.defer(ephemeral=True)
-    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]: await ctx.followup.send("クイズの出題者のみ使用できます."); return
-    if quiz_state["correct_answer_raw"] is None or quiz_state["correct_answer_sorted"] is None: await ctx.followup.send("現在、問題は出題されていません."); return
+    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]:
+        await ctx.followup.send("クイズの出題者のみ使用できます。")
+        return
+    if quiz_state["correct_answer_raw"] is None or quiz_state["correct_answer_normalized"] is None:
+        await ctx.followup.send("現在、問題は出題されていません。")
+        return
     await ctx.followup.send(f"現在の問題の答えは **`{quiz_state['correct_answer_raw']}`** です。")
 
 @quiz_group.command(name="peek_answers", description="最新の回答ログ5件を表示します（出題者のみ）。")
 async def peek_answers(ctx):
     await ctx.defer(ephemeral=True)
-    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]: await ctx.followup.send("クイズの出題者のみ使用できます."); return
-    if not quiz_state["answer_log"]: await ctx.followup.send("まだ誰も回答していません."); return
+    if not quiz_state["is_active"] or ctx.author.id != quiz_state["quiz_master_id"]:
+        await ctx.followup.send("クイズの出題者のみ使用できます。")
+        return
+    if not quiz_state["answer_log"]:
+        await ctx.followup.send("まだ誰も回答していません。")
+        return
     log_lines = ["**📝 最新の回答ログ (最大5件)**"]
     for log_entry in reversed(quiz_state["answer_log"][-5:]):
-        log_time = log_entry["time"].strftime("%H:%M:%S"); log_lines.append(f"`{log_time}` **{log_entry['user']}**: `{log_entry['answer']}`")
+        log_time = log_entry["time"].strftime("%H:%M:%S")
+        log_lines.append(f"`{log_time}` **{log_entry['user']}**: `{log_entry['answer']}`")
     await ctx.followup.send("\n".join(log_lines))
 
 @bot.slash_command(name="make_polyrhythm", description="ポリリズムの画像・動画・音声を生成します。")
-@option("pattern", description="例: 7:5:3o 2-31拍子まで")
+@option("pattern", description="例: 7:4[t2=2,r=2[1]]")
 @option("mode", str, description="生成メディアを選択", choices=["image", "video", "audio"], default="image")
 @option("bpm", int, description="BPM (30-150)", min_value=30, max_value=150, default=80, required=False)
 @option("judge_window", bool, description="判定ウィンドウの表示", default=False)
 async def make_polyrhythm(ctx, pattern: str, mode: str, bpm: int, judge_window: bool):
-    await ctx.defer()
-    if quiz_state["is_active"] and mode == "video": await ctx.followup.send("クイズ進行中は、負荷の高い**動画生成**は使用できません。", ephemeral=True); return
-    pattern_parts = pattern.split(':'); invalid_pattern = False
-    if any(not part.strip() for part in pattern_parts): invalid_pattern = "`:`が連続など、パターン指定が無効です。"
-    if not invalid_pattern:
-        for part in pattern_parts:
-            part = part.strip().lower()
-            if '.' in part: invalid_pattern = f"`{part}`に小数点が使われています。"; break
-            if 'o' in part and not part.endswith('o'): invalid_pattern = f"裏拍を示す`o`は数字の最後に。`{part}`は無効です。"; break
-            if part.count('o') > 1: invalid_pattern = f"`{part}`に`o`が複数あります。"; break
-            num_str = part.removesuffix('o')
-            if not num_str.isdigit(): invalid_pattern = f"`{part}`は有効な拍子指定ではありません。"; break
-            num = int(num_str)
-            if num < 2: invalid_pattern = f"拍子は2以上で。`{part}`は無効です。"; break
-            if num > 31: invalid_pattern = f"拍子数は31まで。`{part}`は無効です。"; break
-    if invalid_pattern: await ctx.followup.send(invalid_pattern, ephemeral=True); return
-    if mode == "image": output_filename = "out.png"
-    elif mode == "video": output_filename = "out.mp4"
-    else: output_filename = "out.mp3"
-    try:
-        command = ["python", "polyrhythm.py", pattern, output_filename]
-        if judge_window: command.append("--judge-window")
-        if mode == "video": command.extend(["--video", f"--bpm={bpm}"])
-        elif mode == "audio": command.extend(["--audio-only", f"--bpm={bpm}"])
-        print(f"実行コマンド: {' '.join(command)}")
-        if mode == "video" and ENABLE_FFMPEG_PROGRESS_LOG:
-            await run_video_process_with_monitoring(command, timeout=300)
+    await ctx.defer(ephemeral=True)
+    
+    if quiz_state["is_active"] and mode == "video":
+        await ctx.followup.send("クイズ進行中は動画生成は使用できません。", ephemeral=True)
+        return
+
+    validation_error = validate_pattern(pattern)
+    if validation_error:
+        message = await ctx.followup.send(f"**入力エラー**\n> `{validation_error}`\n\n🤖 `Gemini 2.5-flash`が修正案を考えています...", ephemeral=True)
+        correction = await get_ai_correction(pattern)
+        
+        if correction and correction["suggestion"] != pattern:
+            params = {"pattern": correction["suggestion"], "mode": mode, "bpm": bpm, "judge_window": judge_window}
+            view = ConfirmCorrectionView(ctx.author.id, params)
+            await message.edit(
+                content=f"🤖 AIからの修正提案です:\n\n**もしかして:** `{correction['suggestion']}` **ですか？**\n> **理由:** {correction['explanation']}\n\nこの内容で実行しますか？",
+                view=view
+            )
         else:
-            result = await run_subprocess_async(command, timeout=300)
-            if result.stdout: print(f"--- polyrhythm.py stdout ---\n{result.stdout}\n--------------------------")
-            if result.stderr: print(f"--- polyrhythm.py stderr ---\n{result.stderr}\n--------------------------")
-        with open(output_filename, "rb") as f:
-            await ctx.followup.send(file=discord.File(f, filename=output_filename))
-    except Exception as e:
-        stderr_message = e.stderr if hasattr(e, 'stderr') else str(e)
-        print(f"コマンド実行中にエラー: {stderr_message}")
-        await ctx.followup.send(f"ごめんなさい、エラーが発生しました。\n```{stderr_message}```", ephemeral=True)
+            await message.edit(content="🤖 AIでも修正案を見つけられませんでした。入力パターンをご確認ください。")
+        return
+
+    await _execute_polyrhythm_generation(ctx, pattern=pattern, mode=mode, bpm=bpm, judge_window=judge_window)
+
+@bot.slash_command(name="polyrhythm_help", description="ポリリズムのパターン記法のヘルプを表示します。")
+async def polyrhythm_help(ctx):
+    help_text = """
+    ## **【🎵 ポリリズム記法ガイド 🎵】**
+    `/make_polyrhythm` や `/quiz` で使えるパターンの書き方を説明します。
+
+    ---
+    ### **1. 基本の書き方**
+    拍子数をコロン(`:`)で区切って指定します。
+    ```
+    pattern: 4:3:5
+    ```
+
+    ---
+    ### **2. 裏拍（オフビート） `o`**
+    パターン全体のタイミングを半拍ずらします。拍子指定の**一番最後**に `o` を付けます。
+    ```
+    pattern: 4o
+    ```
+
+    ---
+    ### **3. オプション機能 `[...]`**
+    拍子数の直後に角括弧`[]`を付けることで、休符や連符などの細かい指定ができます。オプションはカンマ(`,`)で複数指定可能です。
+
+    #### **🎼 A. 休符 `r`**
+    指定した拍の音を休みます。 (`r` = Rest)
+    > **書き方:** `r=<拍番号>`
+
+    **【例】** 8拍子の偶数拍を休符にする
+    ```    pattern: 8[r=2,r=4,r=6,r=8]
+    ```
+
+    #### **🎼 B. 連符 `t`**
+    1拍を指定した数で等分割します。 (`t` = Tuplet)
+    > **書き方:** `t<分割数>=<拍番号>`
+    > （💡 現在は3連符まで対応）
+
+    **【例】】** 4拍子の2拍目を3連符にする
+    ```
+    pattern: 4[t3=2]
+    ```
+
+    ---
+    ### **🚀 応用編：究極のテクニック**
+
+    #### **🔧 A. 合わせ技**
+    休符・連符・裏拍はすべて同時に指定できます。
+    **【例】** 4拍子の裏拍で、2拍目は3連符、4拍目は休符
+    ```
+    pattern: 4[t3=2,r=4]o
+    ```
+
+    #### **🔧 B. 連符の中の休符**
+    連符の特定の音だけを休ませる、最も高度なテクニックです。シャッフルリズムなどが作れます。
+    > **書き方:** `r=<拍番号>[<ノート番号>]`
+
+    **【例】** 4拍子の2拍目を3連符にして、その真ん中の音を休符にする
+    ```
+    pattern: 4[t3=2,r=2]
+    ```
+    """
+    await ctx.respond(help_text, ephemeral=True)
 
 bot.run(TOKEN)
 PY
+
